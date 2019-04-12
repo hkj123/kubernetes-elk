@@ -1,0 +1,182 @@
+---
+#第一个ConfigMap
+#我们知道，Configmap的每个key都会生成一个同名的文件，因此这里会创建一个配置文件filebeat.yml文件，其内容中的环境变量将由DaemonSet中的env部分定义。
+
+#在filebeat.yml中，可以看到Filebeat的一个重要组件： prospectors（采矿者），其主要用来指定从哪些文件中采集数据。这里，prospectors并没有直接指定目标文件，而是间接的引用路径：${path.config}/prospectors.d/*.yml，由前面可知，该路径中的yml文件由第二个ConfigMap定义：
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: filebeat-config
+  namespace: logging
+  labels:
+    k8s-app: filebeat
+    kubernetes.io/cluster-service: "true"
+data:
+  filebeat.yml: |-
+    filebeat.config:
+      prospectors:
+        # Mounted `filebeat-prospectors` configmap:
+        path: ${path.config}/prospectors.d/*.yml
+        # Reload prospectors configs as they change:
+        reload.enabled: false
+      modules:
+        path: ${path.config}/modules.d/*.yml
+        # Reload module configs as they change:
+        reload.enabled: false
+    processors:
+      - add_cloud_metadata:
+
+    cloud.id: ${ELASTIC_CLOUD_ID}
+    cloud.auth: ${ELASTIC_CLOUD_AUTH}
+
+    output.elasticsearch:
+      hosts: ['${ELASTICSEARCH_HOST:elasticsearch}:${ELASTICSEARCH_PORT:9200}']
+      #username: ${ELASTICSEARCH_USERNAME}
+      #password: ${ELASTICSEARCH_PASSWORD}
+---
+#第一个ConfigMap
+
+#第二个ConfigMap
+#如上，type指定了prospectors的类型为docker，表示收集本机的docker日志。containers.ids为*表示监听所有容器。type除了docker，一般使用更多的是log，可以直接指定任何路径上的日志文件
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: filebeat-prospectors
+  namespace: logging
+  labels:
+    k8s-app: filebeat
+    kubernetes.io/cluster-service: "true"
+data:
+  kubernetes.yml: |-
+    - type: log
+      enabled: true
+      paths:
+        - /var/log/*.log
+    - type: docker
+      containers.ids:
+      - "*"
+      processors:
+        - add_kubernetes_metadata:
+            in_cluster: true
+---
+#第二个ConfigMap
+apiVersion: extensions/v1beta1
+kind: DaemonSet
+metadata:
+  name: filebeat
+  namespace: logging
+  labels:
+    k8s-app: filebeat
+    kubernetes.io/cluster-service: "true"
+spec:
+  template:
+    metadata:
+      labels:
+        k8s-app: filebeat
+        kubernetes.io/cluster-service: "true"
+    spec:
+      serviceAccountName: filebeat
+      terminationGracePeriodSeconds: 30
+      containers:
+      - name: filebeat
+        image: docker.elastic.co/beats/filebeat:6.2.4
+        args: [
+          "-c", "/etc/filebeat.yml",
+          "-e",
+        ]
+        env:
+        - name: ELASTICSEARCH_HOST
+          value: "elasticsearch-logging"
+        - name: ELASTICSEARCH_PORT
+          value: "9200"
+        - name: ELASTICSEARCH_USERNAME
+          value:
+        - name: ELASTICSEARCH_PASSWORD
+          value:
+        - name: ELASTIC_CLOUD_ID
+          value:
+        - name: ELASTIC_CLOUD_AUTH
+          value:
+        securityContext:
+          runAsUser: 0
+        resources:
+          limits:
+            memory: 200Mi
+          requests:
+            cpu: 100m
+            memory: 100Mi
+#我们先重点关注一下DaemonSet的volumeMounts和volumes#，以了解ConfigMap的挂载方式
+#ConfigMap配置解析
+        volumeMounts:
+        - name: config
+#config
+#filebeat-config这个Configmap会生成一个filebeat.yml文件，其会被挂载为Filebeat的配置文件/etc/filebeat.yml
+          mountPath: /etc/filebeat.yml
+          readOnly: true
+          subPath: filebeat.yml
+        - name: prospectors
+#prospectors
+#prospectors这个Configmap会生成一个kubernetes.yml文件，其会被挂载到路径/usr/share/filebeat/prospectors.d下，并被filebeat.yml引用
+          mountPath: /usr/share/filebeat/prospectors.d
+          readOnly: true
+        - name: data
+#data
+#Filebeat自身的数据挂载为emptyDir: {}
+          mountPath: /usr/share/filebeat/data
+        - name: varlibdockercontainers
+#varlibdockercontainers
+#K8S集群的日志都存储在/var/lib/docker/containers，Filebeat将从该路径进行收集
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          defaultMode: 0600
+          name: filebeat-config
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: prospectors
+        configMap:
+          defaultMode: 0600
+          name: filebeat-prospectors
+      - name: data
+        emptyDir: {}
+#ConfigMap配置解析
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: filebeat
+subjects:
+- kind: ServiceAccount
+  name: filebeat
+  namespace: logging
+roleRef:
+  kind: ClusterRole
+  name: filebeat
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRole
+metadata:
+  name: filebeat
+  labels:
+    k8s-app: filebeat
+rules:
+- apiGroups: [""] # "" indicates the core API group
+  resources:
+  - namespaces
+  - pods
+  verbs:
+  - get
+  - watch
+  - list
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: filebeat
+  namespace: logging
+  labels:
+    k8s-app: filebeat
